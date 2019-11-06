@@ -1,0 +1,4 @@
+Binaries/
+Intermediate/
+.vscode
+*.DS_Store
