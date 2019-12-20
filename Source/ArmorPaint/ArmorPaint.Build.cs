@@ -44,6 +44,10 @@ public class ArmorPaint : ModuleRules
 				"SlateCore",
                 "MeshDescription",
                 "MeshDescriptionOperations",
+                "DesktopPlatform",
+                "MainFrame",
+                "Core",
+				"Settings",
 				// ... add private dependencies that you statically link with here ...	
 			}
 			);

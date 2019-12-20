@@ -1,8 +1,10 @@
-// Copyright 1998-2019 Epic Games, Inc. All Rights Reserved.
+// ArmorPaint plugin for UE4
+// Based on plugin template, Copyright 1998-2019 Epic Games, Inc. All Rights Reserved.
 
 #include "ArmorPaint.h"
 #include "ArmorPaintStyle.h"
 #include "ArmorPaintCommands.h"
+#include "ArmorPaintSettings.h"
 #include "Misc/MessageDialog.h"
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
@@ -10,8 +12,13 @@
 #include "Engine/Selection.h"
 #include "Templates/Casts.h"
 #include "Interfaces/IPluginManager.h"
-#include "Developer/MeshDescriptionOperations/Public/MeshDescriptionOperations.h"
 #include "Runtime/Engine/Classes/EditorFramework/AssetImportData.h"
+#include "MeshDescriptionOperations.h"
+#include "MeshDescription.h"
+#include "DesktopPlatformModule.h"
+#include "Interfaces/IMainFrameModule.h"
+#include "Modules/ModuleManager.h"
+#include "ISettingsModule.h"
 
 #include "LevelEditor.h"
 
@@ -19,9 +26,23 @@ static const FName ArmorPaintTabName("ArmorPaint");
 
 #define LOCTEXT_NAMESPACE "FArmorPaintModule"
 
+void RegisterSettings()
+{
+	if (ISettingsModule* SettingsModule = FModuleManager::GetModulePtr<ISettingsModule>("Settings"))
+	{
+		SettingsModule->RegisterSettings("Project", "Plugins", "ArmorPaint",
+			LOCTEXT("RuntimeSettingsName", "ArmorPaint"),
+			LOCTEXT("RuntimeSettingsDescription", "Configure ArmorPaint settings"),
+			GetMutableDefault<UArmorPaintSettings>()
+		);
+	}
+}
+
 void FArmorPaintModule::StartupModule()
 {
 	// This code will execute after your module is loaded into memory; the exact timing is specified in the .uplugin file per-module
+
+	RegisterSettings();
 
 	FArmorPaintStyle::Initialize();
 	FArmorPaintStyle::ReloadTextures();
@@ -63,13 +84,30 @@ void FArmorPaintModule::ShutdownModule()
 
 void FArmorPaintModule::PluginButtonClicked()
 {
-	FString path_base = IPluginManager::Get().FindPlugin("ArmorPaint")->GetBaseDir() / TEXT("Binaries") / TEXT("Win64") / TEXT("bin");
+	/*FString OutFolderName;
+	void* ParentWindowWindowHandle = nullptr;
+	IMainFrameModule& MainFrameModule = FModuleManager::LoadModuleChecked<IMainFrameModule>(TEXT("MainFrame"));
+	const TSharedPtr<SWindow>& MainFrameParentWindow = MainFrameModule.GetParentWindow();
+	if (MainFrameParentWindow.IsValid() && MainFrameParentWindow->GetNativeWindow().IsValid())
+	{
+		ParentWindowWindowHandle = MainFrameParentWindow->GetNativeWindow()->GetOSWindowHandle();
+	}
+	FDesktopPlatformModule::Get()->OpenDirectoryDialog(ParentWindowWindowHandle, TEXT("Select folder where ArmorPaint is located"), TEXT(""), OutFolderName);*/
+
+	FString OutFolderName = GetDefault<UArmorPaintSettings>()->ArmorPaintPath.Path;
+
+	FString path_base = OutFolderName;
 	FString path_tmp = path_base / TEXT("data") / TEXT("mesh_tmp.obj");
 	FString path_exe = path_base / TEXT("ArmorPaint.exe");
-	FString path_game = FPaths::GameContentDir().LeftChop(1);
+	FString path_game = FPaths::ProjectContentDir().LeftChop(1);
 	path_base = path_base.Replace(TEXT("/"), TEXT("\\"));
 	path_tmp = path_tmp.Replace(TEXT("/"), TEXT("\\"));
 	path_exe = path_exe.Replace(TEXT("/"), TEXT("\\"));
+
+	if (!FPaths::FileExists(path_exe)) {
+		FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(TEXT("Please configure folder where ArmorPaint is located at 'Project Settings - Plugins - ArmorPaint'")));
+		return;
+	}
 
 	USelection* SelectedActors = GEditor->GetSelectedActors();
 	AActor* Actor = Cast<AActor>(SelectedActors->GetSelectedObject(0));
@@ -83,17 +121,20 @@ void FArmorPaintModule::PluginButtonClicked()
 
 	// Open source file
 	const FAssetImportInfo& AssetImportInfo = StaticMesh->AssetImportData->SourceData;
+	bool found = false;
 	if (AssetImportInfo.SourceFiles.Num() > 0) {
 		// Ensure absolute path
 		FString SourceFilePath = AssetImportInfo.SourceFiles[0].RelativeFilename;
 		SourceFilePath = IFileManager::Get().ConvertToAbsolutePathForExternalAppForRead(*SourceFilePath);
 		SourceFilePath = SourceFilePath.Replace(TEXT("/"), TEXT("\\"));
 		if (FPaths::FileExists(SourceFilePath)) {
-			FString params = TEXT("\"") + SourceFilePath + TEXT("\"") + TEXT(" ") + TEXT("\"") + path_game + TEXT("\"") + TEXT(" ") + TEXT("m_paint_plane");
+			FString params = TEXT("\"") + SourceFilePath + TEXT("\"") + TEXT(" ") + TEXT("\"") + path_game + TEXT("\"");// +TEXT(" ") + TEXT("m_paint_plane");
 			FPlatformProcess::CreateProc(*path_exe, *params, true, false, false, nullptr, 0, nullptr, nullptr);
+			found = true;
 		}
 	}
-	else
+
+	if (!found)
 	{
 		// UE4 obj exporter
 		{
