@@ -159,15 +159,12 @@ void FArmorPaintModule::PluginButtonClicked()
 			FMeshDescription* MeshDescription = StaticMesh->GetMeshDescription(0);
 			if (MeshDescription != nullptr)
 			{
-				uint32 TriangleCount = 0;
-				for (const FPolygonID PolygonID : MeshDescription->Polygons().GetElementIDs())
-				{
-					TriangleCount += MeshDescription->GetPolygonTriangles(PolygonID).Num();
-				}
+				uint32 TriangleCount = MeshDescription->Triangles().Num();
 				if (Count == TriangleCount)
 				{
 					SmoothingMasks.AddZeroed(TriangleCount);
 
+					// FStaticMeshOperations::ConvertHardEdgesToSmoothGroup(*MeshDescription, SmoothingMasks);
 					FMeshDescriptionOperations::ConvertHardEdgesToSmoothGroup(*MeshDescription, SmoothingMasks);
 					for (uint32 SmoothValue : SmoothingMasks)
 					{

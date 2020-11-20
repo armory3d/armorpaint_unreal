@@ -47,6 +47,7 @@ TSharedRef< FSlateStyleSet > FArmorPaintStyle::Create()
 	Style->SetContentRoot(IPluginManager::Get().FindPlugin("ArmorPaint")->GetBaseDir() / TEXT("Resources"));
 
 	Style->Set("ArmorPaint.PluginAction", new IMAGE_BRUSH(TEXT("ButtonIcon_40x"), Icon40x40));
+	Style->Set("ArmorPaint.PluginAction.Small", new IMAGE_BRUSH(TEXT("ButtonIcon_20x"), Icon20x20));
 
 	return Style;
 }
