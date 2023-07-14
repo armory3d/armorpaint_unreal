@@ -1,4 +1,4 @@
-// Copyright 1998-2019 Epic Games, Inc. All Rights Reserved.
+// Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "ArmorPaintCommands.h"
 
@@ -6,7 +6,7 @@
 
 void FArmorPaintCommands::RegisterCommands()
 {
-	UI_COMMAND(PluginAction, "ArmorPaint", "Paint selected object in ArmorPaint", EUserInterfaceActionType::Button, FInputGesture());
+	UI_COMMAND(PluginAction, "ArmorPaint", "Paint selected object in ArmorPaint", EUserInterfaceActionType::Button, FInputChord());
 }
 
 #undef LOCTEXT_NAMESPACE

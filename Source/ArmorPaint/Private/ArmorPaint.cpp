@@ -1,11 +1,12 @@
-// ArmorPaint plugin for UE4
-// Based on plugin template, Copyright 1998-2019 Epic Games, Inc. All Rights Reserved.
+// Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "ArmorPaint.h"
 #include "ArmorPaintStyle.h"
 #include "ArmorPaintCommands.h"
-#include "ArmorPaintSettings.h"
 #include "Misc/MessageDialog.h"
+#include "ToolMenus.h"
+
+#include "ArmorPaintSettings.h"
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
@@ -15,19 +16,19 @@
 #include "Runtime/Engine/Classes/EditorFramework/AssetImportData.h"
 #include "MeshDescriptionOperations.h"
 #include "MeshDescription.h"
-#include "DesktopPlatformModule.h"
 #include "Interfaces/IMainFrameModule.h"
 #include "Modules/ModuleManager.h"
 #include "ISettingsModule.h"
-
 #include "LevelEditor.h"
 
 static const FName ArmorPaintTabName("ArmorPaint");
 
 #define LOCTEXT_NAMESPACE "FArmorPaintModule"
 
-void RegisterSettings()
+void FArmorPaintModule::StartupModule()
 {
+	// This code will execute after your module is loaded into memory; the exact timing is specified in the .uplugin file per-module
+	
 	if (ISettingsModule* SettingsModule = FModuleManager::GetModulePtr<ISettingsModule>("Settings"))
 	{
 		SettingsModule->RegisterSettings("Project", "Plugins", "ArmorPaint",
@@ -36,19 +37,12 @@ void RegisterSettings()
 			GetMutableDefault<UArmorPaintSettings>()
 		);
 	}
-}
-
-void FArmorPaintModule::StartupModule()
-{
-	// This code will execute after your module is loaded into memory; the exact timing is specified in the .uplugin file per-module
-
-	RegisterSettings();
 
 	FArmorPaintStyle::Initialize();
 	FArmorPaintStyle::ReloadTextures();
 
 	FArmorPaintCommands::Register();
-
+	
 	PluginCommands = MakeShareable(new FUICommandList);
 
 	PluginCommands->MapAction(
@@ -56,27 +50,18 @@ void FArmorPaintModule::StartupModule()
 		FExecuteAction::CreateRaw(this, &FArmorPaintModule::PluginButtonClicked),
 		FCanExecuteAction());
 
-	FLevelEditorModule& LevelEditorModule = FModuleManager::LoadModuleChecked<FLevelEditorModule>("LevelEditor");
-
-	{
-		TSharedPtr<FExtender> MenuExtender = MakeShareable(new FExtender());
-		MenuExtender->AddMenuExtension("WindowLayout", EExtensionHook::After, PluginCommands, FMenuExtensionDelegate::CreateRaw(this, &FArmorPaintModule::AddMenuExtension));
-
-		LevelEditorModule.GetMenuExtensibilityManager()->AddExtender(MenuExtender);
-	}
-
-	{
-		TSharedPtr<FExtender> ToolbarExtender = MakeShareable(new FExtender);
-		ToolbarExtender->AddToolBarExtension("Settings", EExtensionHook::After, PluginCommands, FToolBarExtensionDelegate::CreateRaw(this, &FArmorPaintModule::AddToolbarExtension));
-
-		LevelEditorModule.GetToolBarExtensibilityManager()->AddExtender(ToolbarExtender);
-	}
+	UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FArmorPaintModule::RegisterMenus));
 }
 
 void FArmorPaintModule::ShutdownModule()
 {
 	// This function may be called during shutdown to clean up your module.  For modules that support dynamic reloading,
 	// we call this function before unloading the module.
+
+	UToolMenus::UnRegisterStartupCallback(this);
+
+	UToolMenus::UnregisterOwner(this);
+
 	FArmorPaintStyle::Shutdown();
 
 	FArmorPaintCommands::Unregister();
@@ -97,7 +82,7 @@ void FArmorPaintModule::PluginButtonClicked()
 	FString OutFolderName = GetDefault<UArmorPaintSettings>()->ArmorPaintPath.Path;
 
 	FString path_base = OutFolderName;
-	FString path_tmp = path_base / TEXT("data") / TEXT("mesh_tmp.obj");
+	FString path_tmp = path_base / TEXT("data") / TEXT("tmp.obj");
 	FString path_exe = path_base / TEXT("ArmorPaint.exe");
 	FString path_game = FPaths::ProjectContentDir().LeftChop(1);
 	path_base = path_base.Replace(TEXT("/"), TEXT("\\"));
@@ -148,9 +133,9 @@ void FArmorPaintModule::PluginButtonClicked()
 			// Open a second archive here so we can export lightmap coordinates at the same time we export the regular mesh
 			FArchive* File = IFileManager::Get().CreateFileWriter(*Filename);
 
-			TArray<FVector> Verts;				// The verts in the mesh
-			TArray<FVector2D> UVs;				// UV coords from channel 0
-			TArray<FVector> Normals;			// Normals
+			TArray<FVector3f> Verts;				// The verts in the mesh
+			TArray<FVector2f> UVs;				// UV coords from channel 0
+			TArray<FVector3f> Normals;			// Normals
 			TArray<uint32> SmoothingMasks;		// Complete collection of the smoothing groups from all triangles
 			TArray<uint32> UniqueSmoothingMasks;	// Collection of the unique smoothing groups (used when writing out the face info into the OBJ file so we can group by smoothing group)
 
@@ -197,9 +182,9 @@ void FArmorPaintModule::PluginButtonClicked()
 				uint32 Index2 = Indices[(tri * 3) + 1];
 				uint32 Index3 = Indices[(tri * 3) + 2];
 
-				FVector Vertex1 = RenderData.VertexBuffers.PositionVertexBuffer.VertexPosition(Index1);		//(FStaticMeshFullVertex*)(RawVertexData + Index1 * VertexStride);
-				FVector Vertex2 = RenderData.VertexBuffers.PositionVertexBuffer.VertexPosition(Index2);
-				FVector Vertex3 = RenderData.VertexBuffers.PositionVertexBuffer.VertexPosition(Index3);
+				FVector3f Vertex1 = RenderData.VertexBuffers.PositionVertexBuffer.VertexPosition(Index1);		//(FStaticMeshFullVertex*)(RawVertexData + Index1 * VertexStride);
+				FVector3f Vertex2 = RenderData.VertexBuffers.PositionVertexBuffer.VertexPosition(Index2);
+				FVector3f Vertex3 = RenderData.VertexBuffers.PositionVertexBuffer.VertexPosition(Index3);
 
 				// Vertices
 				Verts.Add(Vertex1);
@@ -273,16 +258,31 @@ void FArmorPaintModule::PluginButtonClicked()
 	//material->GetName();
 }
 
-void FArmorPaintModule::AddMenuExtension(FMenuBuilder& Builder)
+void FArmorPaintModule::RegisterMenus()
 {
-	Builder.AddMenuEntry(FArmorPaintCommands::Get().PluginAction);
-}
+	// Owner will be used for cleanup in call to UToolMenus::UnregisterOwner
+	FToolMenuOwnerScoped OwnerScoped(this);
 
-void FArmorPaintModule::AddToolbarExtension(FToolBarBuilder& Builder)
-{
-	Builder.AddToolBarButton(FArmorPaintCommands::Get().PluginAction);
+	{
+		UToolMenu* Menu = UToolMenus::Get()->ExtendMenu("LevelEditor.MainMenu.Window");
+		{
+			FToolMenuSection& Section = Menu->FindOrAddSection("WindowLayout");
+			Section.AddMenuEntryWithCommandList(FArmorPaintCommands::Get().PluginAction, PluginCommands);
+		}
+	}
+
+	{
+		UToolMenu* ToolbarMenu = UToolMenus::Get()->ExtendMenu("LevelEditor.LevelEditorToolBar.PlayToolBar");
+		{
+			FToolMenuSection& Section = ToolbarMenu->FindOrAddSection("PluginTools");
+			{
+				FToolMenuEntry& Entry = Section.AddEntry(FToolMenuEntry::InitToolBarButton(FArmorPaintCommands::Get().PluginAction));
+				Entry.SetCommandList(PluginCommands);
+			}
+		}
+	}
 }
 
 #undef LOCTEXT_NAMESPACE
-
+	
 IMPLEMENT_MODULE(FArmorPaintModule, ArmorPaint)

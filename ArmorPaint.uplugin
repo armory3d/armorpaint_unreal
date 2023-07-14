@@ -1,19 +1,19 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "0.8",
+	"VersionName": "0.9",
 	"FriendlyName": "ArmorPaint",
 	"Description": "Paint objects in ArmorPaint",
-	"Category": "Editor",
+	"Category": "Other",
 	"CreatedBy": "Armory",
 	"CreatedByURL": "https://armorpaint.org/",
 	"DocsURL": "https://armorpaint.org/manual",
 	"MarketplaceURL": "",
 	"SupportURL": "https://armorpaint.org/community",
 	"CanContainContent": false,
-	"IsBetaVersion": true,
+	"IsBetaVersion": false,
 	"IsExperimentalVersion": false,
-	"Installed": true,
+	"Installed": false,
 	"Modules": [
 		{
 			"Name": "ArmorPaint",
