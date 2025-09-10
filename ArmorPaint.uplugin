@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "0.9",
+	"VersionName": "1.0alpha",
 	"FriendlyName": "ArmorPaint",
 	"Description": "Paint objects in ArmorPaint",
 	"Category": "Other",
