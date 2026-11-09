@@ -46,10 +46,11 @@ public class ArmorPaint : ModuleRules
 
 				"LevelEditor",
 				"MeshDescription",
-				"MeshDescriptionOperations",
+				"StaticMeshDescription",
 				"DesktopPlatform",
-				"MainFrame",
+				"AssetTools",
 				"Settings",
+				"MaterialEditor",
 				// ... add private dependencies that you statically link with here ...	
 			}
 			);
