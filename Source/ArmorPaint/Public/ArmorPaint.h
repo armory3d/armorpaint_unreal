@@ -12,8 +12,9 @@ class UStaticMeshComponent;
 class UMaterialInterface;
 class UTexture2D;
 
-// Paints the selected object in ArmorPaint and brings the painted textures back.
-// Each painted object gets a project at <Project>/ArmorPaint/<Name>/<Name>.arm.
+// Paints the selected objects in ArmorPaint and brings the painted textures back.
+// The selection gets a project at <Project>/ArmorPaint/<Name>/<Name>.arm, multiple selected
+// objects are painted together in one project and share the resulting material.
 // When ArmorPaint closes, textures are exported from the project next to it,
 // imported into /Game/ArmorPaint/<Name> and applied to the object through a material.
 class FArmorPaintModule : public IModuleInterface
@@ -35,7 +36,14 @@ private:
 		FProcHandle Process;
 		FString Name;
 		FString ArmPath;
-		TWeakObjectPtr<UStaticMeshComponent> Component;
+		TArray<TWeakObjectPtr<UStaticMeshComponent>> Components;
+	};
+
+	// A selected object to paint
+	struct FPaintTarget
+	{
+		FString Name;
+		UStaticMeshComponent* Component;
 	};
 
 	void RegisterMenus();
@@ -44,12 +52,12 @@ private:
 
 	FString GetExecutable(bool bPrompt);
 	bool StartArmorPaint(const FString& Exe, const FString& Args, bool bHidden, FProcHandle& OutProcess);
-	bool ExportMeshToObj(UStaticMesh* StaticMesh, const FString& ObjPath, const FString& Name);
+	bool ExportMeshesToObj(const TArray<FPaintTarget>& Targets, const FString& ObjPath);
 	bool ExportTextures(const FString& ArmPath);
 	bool ImportTextures(const FString& Name, TMap<FString, UTexture2D*>& OutTextures);
 	UMaterialInterface* GetOrCreateMaterial(const FString& Name, const TMap<FString, UTexture2D*>& Textures);
-	void ApplyMaterial(UStaticMeshComponent* Component, UMaterialInterface* Material);
-	void UpdateProject(const FString& Name, UStaticMeshComponent* Component);
+	void ApplyMaterial(const TArray<UStaticMeshComponent*>& Components, UMaterialInterface* Material);
+	void UpdateProject(const FString& Name, const TArray<UStaticMeshComponent*>& Components);
 
 	TSharedPtr<class FUICommandList> PluginCommands;
 	TArray<FPending> Pending;

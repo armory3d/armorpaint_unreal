@@ -91,6 +91,20 @@ namespace ArmorPaint
 		return Name.IsEmpty() ? FString(TEXT("Object")) : Name;
 	}
 
+	// Project name of the painted objects, sorted by name. Multiple objects share one project,
+	// named after all of them, or after the first one and a hash when that gets too long.
+	static FString ProjectName(const TArray<FString>& Names)
+	{
+		static constexpr int32 MaxLength = 48;
+		const FString Joined = FString::Join(Names, TEXT("_"));
+		if (Names.Num() == 1 || Joined.Len() <= MaxLength)
+		{
+			return Joined;
+		}
+		const uint32 Hash = FCrc::StrCrc32(*FString::Join(Names, TEXT("/")));
+		return FString::Printf(TEXT("%s_%d_%08x"), *Names[0].Left(MaxLength - 18), Names.Num(), Hash);
+	}
+
 	static FString Quote(const FString& Path)
 	{
 		FString Result = Path;
@@ -206,27 +220,40 @@ void FArmorPaintModule::ShutdownModule()
 
 void FArmorPaintModule::PluginButtonClicked()
 {
-	AActor* Actor = GEditor ? GEditor->GetSelectedActors()->GetTop<AActor>() : nullptr;
-	UStaticMeshComponent* Component = nullptr;
-	if (Actor)
+	// Every selected actor with a static mesh is painted, the first static mesh component of each
+	TArray<AActor*> Actors;
+	if (GEditor)
+	{
+		GEditor->GetSelectedActors()->GetSelectedObjects<AActor>(Actors);
+	}
+	TArray<FPaintTarget> Targets;
+	for (AActor* Actor : Actors)
 	{
 		TInlineComponentArray<UStaticMeshComponent*> Components(Actor);
 		for (UStaticMeshComponent* C : Components)
 		{
 			if (C->GetStaticMesh())
 			{
-				Component = C;
+				Targets.Add({ SanitizeName(Actor->GetActorLabel()), C });
 				break;
 			}
 		}
 	}
-	if (!Component)
+	if (Targets.Num() == 0)
 	{
-		FMessageDialog::Open(EAppMsgType::Ok, LOCTEXT("NoSelection", "Select an actor with a Static Mesh component to paint."));
+		FMessageDialog::Open(EAppMsgType::Ok, LOCTEXT("NoSelection", "Select one or more actors with a Static Mesh component to paint."));
 		return;
 	}
 
-	const FString Name = SanitizeName(Actor->GetActorLabel());
+	// Sorted so that the same selection maps to the same project regardless of selection order
+	Targets.StableSort([](const FPaintTarget& A, const FPaintTarget& B) { return A.Name < B.Name; });
+	TArray<FString> Names;
+	for (const FPaintTarget& T : Targets)
+	{
+		Names.Add(T.Name);
+	}
+	const FString Name = ProjectName(Names);
+
 	const FString Arm = ArmPath(Name);
 	for (const FPending& P : Pending)
 	{
@@ -254,7 +281,7 @@ void FArmorPaintModule::PluginButtonClicked()
 		// so that saving on close goes there without asking for a location
 		const FString TempDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectIntermediateDir() / TEXT("ArmorPaint"));
 		const FString ObjPath = TempDir / Name + TEXT(".obj");
-		if (!ExportMeshToObj(Component->GetStaticMesh(), ObjPath, Name))
+		if (!ExportMeshesToObj(Targets, ObjPath))
 		{
 			return;
 		}
@@ -280,8 +307,13 @@ void FArmorPaintModule::PluginButtonClicked()
 		return;
 	}
 
-	Pending.Add({ Process, Name, Arm, Component });
-	UE_LOG(LogArmorPaint, Log, TEXT("Painting '%s', textures will be applied when ArmorPaint is closed."), *Name);
+	FPending NewPending{ Process, Name, Arm };
+	for (const FPaintTarget& T : Targets)
+	{
+		NewPending.Components.Add(T.Component);
+	}
+	Pending.Add(MoveTemp(NewPending));
+	UE_LOG(LogArmorPaint, Log, TEXT("Painting '%s' (%s), textures will be applied when ArmorPaint is closed."), *Name, *FString::Join(Names, TEXT(", ")));
 	Notify(FText::Format(LOCTEXT("Painting", "Painting '{0}' in ArmorPaint. Save and close ArmorPaint to apply the textures."), FText::FromString(Name)));
 }
 
@@ -347,115 +379,184 @@ bool FArmorPaintModule::StartArmorPaint(const FString& Exe, const FString& Args,
 	return true;
 }
 
-bool FArmorPaintModule::ExportMeshToObj(UStaticMesh* StaticMesh, const FString& ObjPath, const FString& Name)
+// Writes all targets into one OBJ file, one object per target.
+// A single object is exported in its local space. Multiple objects are exported with their
+// world transforms, centered around the selection, so they are laid out in ArmorPaint as in the level.
+bool FArmorPaintModule::ExportMeshesToObj(const TArray<FPaintTarget>& Targets, const FString& ObjPath)
 {
-	// Unreal is left-handed Z-up, OBJ is right-handed Y-up: swap Y and Z, which also keeps the winding order front facing.
-	// Unreal UVs start at the top of the texture, OBJ UVs at the bottom.
-	FString Obj;
-	Obj.Appendf(TEXT("o %s\n"), *Name);
-
-	// Prefer the source mesh: render data may be a reduced Nanite fallback mesh
-	const FMeshDescription* MeshDescription = StaticMesh->GetMeshDescription(0);
-	if (MeshDescription && MeshDescription->Triangles().Num() > 0)
+	// Validate all meshes first, normals are written only when every mesh has them
+	bool bNormals = true;
+	for (const FPaintTarget& T : Targets)
 	{
-		FStaticMeshConstAttributes Attributes(*MeshDescription);
-		TVertexAttributesConstRef<FVector3f> Positions = Attributes.GetVertexPositions();
-		TVertexInstanceAttributesConstRef<FVector3f> Normals = Attributes.GetVertexInstanceNormals();
-		TVertexInstanceAttributesConstRef<FVector2f> UVs = Attributes.GetVertexInstanceUVs();
-		if (!UVs.IsValid() || UVs.GetNumChannels() == 0)
+		UStaticMesh* StaticMesh = T.Component->GetStaticMesh();
+		const FMeshDescription* MeshDescription = StaticMesh->GetMeshDescription(0);
+		if (MeshDescription && MeshDescription->Triangles().Num() > 0)
 		{
-			FMessageDialog::Open(EAppMsgType::Ok, FText::Format(LOCTEXT("NoUVs", "'{0}' has no UVs, it can not be painted."), FText::FromString(StaticMesh->GetName())));
+			FStaticMeshConstAttributes Attributes(*MeshDescription);
+			TVertexInstanceAttributesConstRef<FVector2f> UVs = Attributes.GetVertexInstanceUVs();
+			if (!UVs.IsValid() || UVs.GetNumChannels() == 0)
+			{
+				FMessageDialog::Open(EAppMsgType::Ok, FText::Format(LOCTEXT("NoUVs", "'{0}' has no UVs, it can not be painted."), FText::FromString(StaticMesh->GetName())));
+				return false;
+			}
+			// Normals are left empty when the mesh computes them on build, let ArmorPaint compute them in that case
+			TVertexInstanceAttributesConstRef<FVector3f> Normals = Attributes.GetVertexInstanceNormals();
+			bNormals &= Normals.IsValid();
+			for (const FVertexInstanceID Instance : MeshDescription->VertexInstances().GetElementIDs())
+			{
+				if (!bNormals)
+				{
+					break;
+				}
+				bNormals = !Normals[Instance].IsNearlyZero();
+			}
+		}
+		else if (!StaticMesh->HasValidRenderData())
+		{
+			FMessageDialog::Open(EAppMsgType::Ok, FText::Format(LOCTEXT("NoMesh", "Mesh data of '{0}' is not available."), FText::FromString(StaticMesh->GetName())));
 			return false;
 		}
+	}
 
-		// Normals are left empty when the mesh computes them on build, let ArmorPaint compute them in that case
-		bool bHasNormals = Normals.IsValid();
-		for (const FVertexInstanceID Instance : MeshDescription->VertexInstances().GetElementIDs())
+	FVector Center = FVector::ZeroVector;
+	if (Targets.Num() > 1)
+	{
+		FBox Bounds(ForceInit);
+		for (const FPaintTarget& T : Targets)
 		{
-			if (!bHasNormals)
-			{
-				break;
-			}
-			bHasNormals = !Normals[Instance].IsNearlyZero();
+			Bounds += T.Component->Bounds.GetBox();
 		}
+		Center = Bounds.GetCenter();
+	}
 
-		TArray<int32> VertexIndex;
-		VertexIndex.SetNumZeroed(MeshDescription->Vertices().GetArraySize());
-		int32 Index = 1;
-		for (const FVertexID Vertex : MeshDescription->Vertices().GetElementIDs())
+	// Unreal is left-handed Z-up, OBJ is right-handed Y-up: swap Y and Z, which also keeps the winding order front facing.
+	// Unreal UVs start at the top of the texture, OBJ UVs at the bottom.
+	// OBJ indices are global to the file, each object continues after the previous one.
+	FString Obj;
+	int32 PositionBase = 0;
+	int32 InstanceBase = 0;
+	for (const FPaintTarget& T : Targets)
+	{
+		UStaticMesh* StaticMesh = T.Component->GetStaticMesh();
+		Obj.Appendf(TEXT("o %s\n"), *T.Name);
+
+		FMatrix Matrix = FMatrix::Identity;
+		if (Targets.Num() > 1)
 		{
-			VertexIndex[Vertex.GetValue()] = Index++;
-			const FVector3f P = Positions[Vertex] * ObjScale;
-			AppendObjLine(Obj, TEXT("v"), { P.X, P.Z, P.Y });
+			Matrix = T.Component->GetComponentTransform().ToMatrixWithScale();
+			Matrix.SetOrigin(Matrix.GetOrigin() - Center);
 		}
+		const FMatrix NormalMatrix = Matrix.Inverse().GetTransposed();
+		// Mirroring transforms flip the winding order
+		const bool bFlip = Matrix.Determinant() < 0.0;
 
-		TArray<int32> InstanceIndex;
-		InstanceIndex.SetNumZeroed(MeshDescription->VertexInstances().GetArraySize());
-		Index = 1;
-		for (const FVertexInstanceID Instance : MeshDescription->VertexInstances().GetElementIDs())
+		auto AppendPosition = [&Obj, &Matrix](const FVector3f& Position)
 		{
-			InstanceIndex[Instance.GetValue()] = Index++;
-			const FVector2f UV = UVs.Get(Instance, 0);
-			AppendObjLine(Obj, TEXT("vt"), { UV.X, 1.0f - UV.Y });
-			if (bHasNormals)
-			{
-				const FVector3f N = Normals[Instance];
-				AppendObjLine(Obj, TEXT("vn"), { N.X, N.Z, N.Y });
-			}
-		}
-
-		for (const FTriangleID Triangle : MeshDescription->Triangles().GetElementIDs())
+			const FVector P = Matrix.TransformPosition(FVector(Position)) * ObjScale;
+			AppendObjLine(Obj, TEXT("v"), { (float)P.X, (float)P.Z, (float)P.Y });
+		};
+		auto AppendNormal = [&Obj, &NormalMatrix](const FVector3f& Normal)
+		{
+			const FVector N = NormalMatrix.TransformVector(FVector(Normal)).GetSafeNormal();
+			AppendObjLine(Obj, TEXT("vn"), { (float)N.X, (float)N.Z, (float)N.Y });
+		};
+		auto AppendFace = [&Obj, bNormals, bFlip](const int32 (&V)[3], const int32 (&I)[3])
 		{
 			Obj += TEXT("f");
-			for (const FVertexInstanceID Instance : MeshDescription->GetTriangleVertexInstances(Triangle))
+			for (int32 k = 0; k < 3; k++)
 			{
-				const int32 V = VertexIndex[MeshDescription->GetVertexInstanceVertex(Instance).GetValue()];
-				const int32 I = InstanceIndex[Instance.GetValue()];
-				if (bHasNormals)
+				const int32 j = bFlip ? 2 - k : k;
+				if (bNormals)
 				{
-					Obj.Appendf(TEXT(" %d/%d/%d"), V, I, I);
+					Obj.Appendf(TEXT(" %d/%d/%d"), V[j], I[j], I[j]);
 				}
 				else
 				{
-					Obj.Appendf(TEXT(" %d/%d"), V, I);
+					Obj.Appendf(TEXT(" %d/%d"), V[j], I[j]);
 				}
 			}
 			Obj += TEXT("\n");
-		}
-	}
-	else if (StaticMesh->HasValidRenderData())
-	{
-		const FStaticMeshLODResources& LOD = StaticMesh->GetLODForExport(0);
-		const FStaticMeshVertexBuffers& Buffers = LOD.VertexBuffers;
-		const uint32 VertexCount = Buffers.PositionVertexBuffer.GetNumVertices();
-		for (uint32 i = 0; i < VertexCount; i++)
+		};
+
+		// Prefer the source mesh: render data may be a reduced Nanite fallback mesh
+		const FMeshDescription* MeshDescription = StaticMesh->GetMeshDescription(0);
+		if (MeshDescription && MeshDescription->Triangles().Num() > 0)
 		{
-			const FVector3f P = Buffers.PositionVertexBuffer.VertexPosition(i) * ObjScale;
-			AppendObjLine(Obj, TEXT("v"), { P.X, P.Z, P.Y });
+			FStaticMeshConstAttributes Attributes(*MeshDescription);
+			TVertexAttributesConstRef<FVector3f> Positions = Attributes.GetVertexPositions();
+			TVertexInstanceAttributesConstRef<FVector3f> Normals = Attributes.GetVertexInstanceNormals();
+			TVertexInstanceAttributesConstRef<FVector2f> UVs = Attributes.GetVertexInstanceUVs();
+
+			TArray<int32> VertexIndex;
+			VertexIndex.SetNumZeroed(MeshDescription->Vertices().GetArraySize());
+			int32 Count = 0;
+			for (const FVertexID Vertex : MeshDescription->Vertices().GetElementIDs())
+			{
+				VertexIndex[Vertex.GetValue()] = PositionBase + ++Count;
+				AppendPosition(Positions[Vertex]);
+			}
+			PositionBase += Count;
+
+			TArray<int32> InstanceIndex;
+			InstanceIndex.SetNumZeroed(MeshDescription->VertexInstances().GetArraySize());
+			Count = 0;
+			for (const FVertexInstanceID Instance : MeshDescription->VertexInstances().GetElementIDs())
+			{
+				InstanceIndex[Instance.GetValue()] = InstanceBase + ++Count;
+				const FVector2f UV = UVs.Get(Instance, 0);
+				AppendObjLine(Obj, TEXT("vt"), { UV.X, 1.0f - UV.Y });
+				if (bNormals)
+				{
+					AppendNormal(Normals[Instance]);
+				}
+			}
+			InstanceBase += Count;
+
+			for (const FTriangleID Triangle : MeshDescription->Triangles().GetElementIDs())
+			{
+				TArrayView<const FVertexInstanceID> Instances = MeshDescription->GetTriangleVertexInstances(Triangle);
+				int32 V[3], I[3];
+				for (int32 k = 0; k < 3; k++)
+				{
+					V[k] = VertexIndex[MeshDescription->GetVertexInstanceVertex(Instances[k]).GetValue()];
+					I[k] = InstanceIndex[Instances[k].GetValue()];
+				}
+				AppendFace(V, I);
+			}
 		}
-		for (uint32 i = 0; i < VertexCount; i++)
+		else
 		{
-			const FVector2f UV = Buffers.StaticMeshVertexBuffer.GetVertexUV(i, 0);
-			AppendObjLine(Obj, TEXT("vt"), { UV.X, 1.0f - UV.Y });
+			// Render data: positions, UVs and normals share one index
+			const FStaticMeshLODResources& LOD = StaticMesh->GetLODForExport(0);
+			const FStaticMeshVertexBuffers& Buffers = LOD.VertexBuffers;
+			const int32 VertexCount = (int32)Buffers.PositionVertexBuffer.GetNumVertices();
+			for (int32 i = 0; i < VertexCount; i++)
+			{
+				AppendPosition(Buffers.PositionVertexBuffer.VertexPosition(i));
+			}
+			for (int32 i = 0; i < VertexCount; i++)
+			{
+				const FVector2f UV = Buffers.StaticMeshVertexBuffer.GetVertexUV(i, 0);
+				AppendObjLine(Obj, TEXT("vt"), { UV.X, 1.0f - UV.Y });
+				if (bNormals)
+				{
+					AppendNormal(FVector3f(Buffers.StaticMeshVertexBuffer.VertexTangentZ(i)));
+				}
+			}
+			const FIndexArrayView Indices = LOD.IndexBuffer.GetArrayView();
+			for (int32 i = 0; i + 2 < Indices.Num(); i += 3)
+			{
+				int32 V[3], I[3];
+				for (int32 k = 0; k < 3; k++)
+				{
+					V[k] = PositionBase + (int32)Indices[i + k] + 1;
+					I[k] = InstanceBase + (int32)Indices[i + k] + 1;
+				}
+				AppendFace(V, I);
+			}
+			PositionBase += VertexCount;
+			InstanceBase += VertexCount;
 		}
-		for (uint32 i = 0; i < VertexCount; i++)
-		{
-			const FVector3f N = Buffers.StaticMeshVertexBuffer.VertexTangentZ(i);
-			AppendObjLine(Obj, TEXT("vn"), { N.X, N.Z, N.Y });
-		}
-		const FIndexArrayView Indices = LOD.IndexBuffer.GetArrayView();
-		for (int32 i = 0; i + 2 < Indices.Num(); i += 3)
-		{
-			const uint32 A = Indices[i] + 1;
-			const uint32 B = Indices[i + 1] + 1;
-			const uint32 C = Indices[i + 2] + 1;
-			Obj.Appendf(TEXT("f %u/%u/%u %u/%u/%u %u/%u/%u\n"), A, A, A, B, B, B, C, C, C);
-		}
-	}
-	else
-	{
-		FMessageDialog::Open(EAppMsgType::Ok, FText::Format(LOCTEXT("NoMesh", "Mesh data of '{0}' is not available."), FText::FromString(StaticMesh->GetName())));
-		return false;
 	}
 
 	if (!SaveUtf8(Obj, ObjPath))
@@ -492,7 +593,15 @@ bool FArmorPaintModule::Tick(float DeltaTime)
 			UE_LOG(LogArmorPaint, Log, TEXT("%s was not saved, no textures to apply."), *P.ArmPath);
 			continue;
 		}
-		UpdateProject(P.Name, P.Component.Get());
+		TArray<UStaticMeshComponent*> Components;
+		for (const TWeakObjectPtr<UStaticMeshComponent>& Component : P.Components)
+		{
+			if (UStaticMeshComponent* C = Component.Get())
+			{
+				Components.Add(C);
+			}
+		}
+		UpdateProject(P.Name, Components);
 	}
 	return true;
 }
@@ -517,12 +626,12 @@ void FArmorPaintModule::OnApplicationActivationStateChanged(bool bActive)
 		const FString Base = TexturePath(Name, TEXT("base"));
 		if (!FPaths::FileExists(Base) || IFileManager::Get().GetTimeStamp(*Arm) > IFileManager::Get().GetTimeStamp(*Base))
 		{
-			UpdateProject(Name, nullptr);
+			UpdateProject(Name, {});
 		}
 	}
 }
 
-void FArmorPaintModule::UpdateProject(const FString& Name, UStaticMeshComponent* Component)
+void FArmorPaintModule::UpdateProject(const FString& Name, const TArray<UStaticMeshComponent*>& Components)
 {
 	TGuardValue<bool> Guard(bUpdating, true);
 
@@ -540,9 +649,9 @@ void FArmorPaintModule::UpdateProject(const FString& Name, UStaticMeshComponent*
 	}
 
 	UMaterialInterface* Material = GetOrCreateMaterial(Name, Textures);
-	if (Material && Component)
+	if (Material && Components.Num() > 0)
 	{
-		ApplyMaterial(Component, Material);
+		ApplyMaterial(Components, Material);
 	}
 
 	UE_LOG(LogArmorPaint, Log, TEXT("Textures of '%s' updated in %s"), *Name, *ContentPath(Name));
@@ -716,25 +825,35 @@ UMaterialInterface* FArmorPaintModule::GetOrCreateMaterial(const FString& Name, 
 	return Material;
 }
 
-// Assigns the material to all slots of the painted component, ArmorPaint paints the whole mesh as one
-void FArmorPaintModule::ApplyMaterial(UStaticMeshComponent* Component, UMaterialInterface* Material)
+// Assigns the material to all slots of the painted components, ArmorPaint paints the whole mesh as one
+void FArmorPaintModule::ApplyMaterial(const TArray<UStaticMeshComponent*>& Components, UMaterialInterface* Material)
 {
-	const int32 NumSlots = FMath::Max(1, Component->GetNumMaterials());
-	bool bChanged = false;
-	for (int32 i = 0; i < NumSlots; i++)
+	auto NumSlots = [](UStaticMeshComponent* Component) { return FMath::Max(1, Component->GetNumMaterials()); };
+	TArray<UStaticMeshComponent*> Changed;
+	for (UStaticMeshComponent* Component : Components)
 	{
-		bChanged |= Component->GetMaterial(i) != Material;
+		for (int32 i = 0; i < NumSlots(Component); i++)
+		{
+			if (Component->GetMaterial(i) != Material)
+			{
+				Changed.Add(Component);
+				break;
+			}
+		}
 	}
-	if (!bChanged)
+	if (Changed.Num() == 0)
 	{
 		return;
 	}
 
 	FScopedTransaction Transaction(LOCTEXT("ApplyMaterial", "Apply ArmorPaint Material"));
-	Component->Modify();
-	for (int32 i = 0; i < NumSlots; i++)
+	for (UStaticMeshComponent* Component : Changed)
 	{
-		Component->SetMaterial(i, Material);
+		Component->Modify();
+		for (int32 i = 0; i < NumSlots(Component); i++)
+		{
+			Component->SetMaterial(i, Material);
+		}
 	}
 }
 
