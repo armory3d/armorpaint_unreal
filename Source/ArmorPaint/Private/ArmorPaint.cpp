@@ -9,13 +9,19 @@
 #include "AssetToolsModule.h"
 #include "Components/StaticMeshComponent.h"
 #include "DesktopPlatformModule.h"
+#include "Dom/JsonObject.h"
 #include "Editor.h"
+#include "EngineUtils.h"
 #include "Engine/Selection.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture2D.h"
 #include "Factories/MaterialFactoryNew.h"
+#include "ImageCore.h"
+#include "ImageUtils.h"
+#include "IMaterialBakingModule.h"
 #include "FileHelpers.h"
 #include "Framework/Application/SlateApplication.h"
+#include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "Framework/Notifications/NotificationManager.h"
 #include "GameFramework/Actor.h"
 #include "HAL/FileManager.h"
@@ -25,12 +31,15 @@
 #include "MaterialEditingLibrary.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialExpressionTextureSample.h"
+#include "MaterialBakingHelpers.h"
+#include "MaterialBakingStructures.h"
 #include "MeshDescription.h"
 #include "Misc/FileHelper.h"
 #include "Misc/MessageDialog.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopedSlowTask.h"
 #include "ScopedTransaction.h"
+#include "Serialization/JsonSerializer.h"
 #include "StaticMeshAttributes.h"
 #include "StaticMeshResources.h"
 #include "ToolMenus.h"
@@ -80,6 +89,51 @@ namespace ArmorPaint
 		return TEXT("/Game/ArmorPaint/") + Name;
 	}
 
+	static FString OriginalsPath(const FString& Name)
+	{
+		return ProjectsDir() / Name / TEXT("original_materials.json");
+	}
+
+	static FString ComponentKey(const UStaticMeshComponent* Component)
+	{
+		const AActor* Owner = Component->GetOwner();
+		return (Owner ? Owner->GetPathName() : FString()) + TEXT("|") + Component->GetName();
+	}
+
+	// /Game/ArmorPaint/<Name>/M_<Name> gives <Name>, other materials an empty string
+	static FString ProjectOfMaterial(const UMaterialInterface* Material)
+	{
+		static const FString Prefix = TEXT("/Game/ArmorPaint/");
+		if (!Material)
+		{
+			return FString();
+		}
+		const FString Package = Material->GetOutermost()->GetName();
+		if (!Package.StartsWith(Prefix))
+		{
+			return FString();
+		}
+		FString Name, Asset;
+		if (!Package.Mid(Prefix.Len()).Split(TEXT("/"), &Name, &Asset) || Asset != TEXT("M_") + Name)
+		{
+			return FString();
+		}
+		return Name;
+	}
+
+	static FString PaintedProject(const UStaticMeshComponent* Component)
+	{
+		for (int32 i = 0; i < Component->GetNumMaterials(); i++)
+		{
+			const FString Name = ProjectOfMaterial(Component->GetMaterial(i));
+			if (!Name.IsEmpty())
+			{
+				return Name;
+			}
+		}
+		return FString();
+	}
+
 	// The name is used both for files and asset names, keep it to characters valid in both
 	static FString SanitizeName(const FString& Label)
 	{
@@ -110,6 +164,14 @@ namespace ArmorPaint
 		FString Result = Path;
 		FPaths::MakePlatformFilename(Result);
 		return TEXT("\"") + Result + TEXT("\"");
+	}
+
+	// Path as a string literal for ArmorPaint scripts
+	static FString CLiteral(const FString& Path)
+	{
+		FString Result = Path;
+		FPaths::MakePlatformFilename(Result);
+		return TEXT("\"") + Result.Replace(TEXT("\\"), TEXT("\\\\")).Replace(TEXT("\""), TEXT("\\\"")) + TEXT("\"");
 	}
 
 	static void Notify(const FText& Text, bool bSuccess = true)
@@ -176,6 +238,11 @@ void FArmorPaintModule::StartupModule()
 	PluginCommands->MapAction(
 		FArmorPaintCommands::Get().PluginAction,
 		FExecuteAction::CreateRaw(this, &FArmorPaintModule::PluginButtonClicked),
+		FCanExecuteAction());
+
+	PluginCommands->MapAction(
+		FArmorPaintCommands::Get().UnpaintAction,
+		FExecuteAction::CreateRaw(this, &FArmorPaintModule::UnpaintButtonClicked),
 		FCanExecuteAction());
 
 	UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FArmorPaintModule::RegisterMenus));
@@ -286,13 +353,13 @@ void FArmorPaintModule::PluginButtonClicked()
 			return;
 		}
 
+		TMap<FString, FString> Baked;
+		BakeTextures(Targets, TempDir / Name, Baked);
+
 		IFileManager::Get().MakeDirectory(*FPaths::GetPath(Arm), true);
-		FString ArmLiteral = Arm;
-		FPaths::MakePlatformFilename(ArmLiteral);
-		ArmLiteral = ArmLiteral.Replace(TEXT("\\"), TEXT("\\\\")).Replace(TEXT("\""), TEXT("\\\""));
+		SaveOriginalMaterials(Name, Targets);
 		const FString ScriptPath = TempDir / Name + TEXT("_link.c");
-		const FString Script = FString::Printf(TEXT("void main() {\n\tproject_filepath_set(\"%s\");\n\tproject_save(0);\n}\n"), *ArmLiteral);
-		if (!SaveUtf8(Script, ScriptPath))
+		if (!SaveUtf8(LinkScript(Arm, Baked), ScriptPath))
 		{
 			UE_LOG(LogArmorPaint, Error, TEXT("Failed to write %s"), *ScriptPath);
 			return;
@@ -565,6 +632,213 @@ bool FArmorPaintModule::ExportMeshesToObj(const TArray<FPaintTarget>& Targets, c
 		return false;
 	}
 	return true;
+}
+
+// Bakes the current materials of the targets into one texture set in their shared UV map, <Dir>_<type>.png.
+// Each material slot is baked over the triangles using it.
+bool FArmorPaintModule::BakeTextures(const TArray<FPaintTarget>& Targets, const FString& Dir, TMap<FString, FString>& OutPaths)
+{
+	static const EMaterialProperty Properties[] = { MP_BaseColor, MP_Normal, MP_AmbientOcclusion, MP_Roughness, MP_Metallic };
+	const int32 BakeSize = GetDefault<UArmorPaintSettings>()->GetBakeSize();
+	const FString Name = FPaths::GetCleanFilename(Dir);
+
+	TArray<FMaterialData> Materials;
+	TArray<FMeshData> Meshes;
+	for (const FPaintTarget& Target : Targets)
+	{
+		UStaticMeshComponent* Component = Target.Component;
+		UStaticMesh* StaticMesh = Component->GetStaticMesh();
+		const FMeshDescription* MeshDescription = StaticMesh->GetMeshDescription(0);
+		if (!MeshDescription || MeshDescription->Triangles().Num() == 0)
+		{
+			UE_LOG(LogArmorPaint, Warning, TEXT("Source mesh of '%s' is not available, its materials are not baked."), *StaticMesh->GetName());
+			continue;
+		}
+
+		// Polygon groups become mesh sections in order, each section is drawn with one material slot
+		FStaticMeshConstAttributes Attributes(*MeshDescription);
+		TPolygonGroupAttributesConstRef<FName> SlotNames = Attributes.GetPolygonGroupMaterialSlotNames();
+		TMap<int32, TArray<int32>> GroupsPerSlot;
+		int32 SectionIndex = 0;
+		for (const FPolygonGroupID Group : MeshDescription->PolygonGroups().GetElementIDs())
+		{
+			int32 Slot = INDEX_NONE;
+			if (StaticMesh->GetSectionInfoMap().IsValidSection(0, SectionIndex))
+			{
+				Slot = StaticMesh->GetSectionInfoMap().Get(0, SectionIndex).MaterialIndex;
+			}
+			else
+			{
+				Slot = StaticMesh->GetMaterialIndexFromImportedMaterialSlotName(SlotNames[Group]);
+			}
+			if (Slot == INDEX_NONE)
+			{
+				Slot = Group.GetValue();
+			}
+			GroupsPerSlot.FindOrAdd(Slot).Add(Group.GetValue());
+			SectionIndex++;
+		}
+
+		const bool bMirrored = Component->GetComponentTransform().GetDeterminant() < 0.0f;
+		for (const TPair<int32, TArray<int32>>& Pair : GroupsPerSlot)
+		{
+			UMaterialInterface* Material = Component->GetMaterial(Pair.Key);
+			FMaterialData& MaterialData = Materials.AddDefaulted_GetRef();
+			MaterialData.Material = Material ? Material : UMaterial::GetDefaultMaterial(MD_Surface);
+			for (EMaterialProperty Property : Properties)
+			{
+				MaterialData.PropertySizes.Add(Property, FIntPoint(BakeSize, BakeSize));
+			}
+			// Slots are combined first, background pixels tell which ones each slot covers
+			MaterialData.bPerformBorderSmear = false;
+			MaterialData.bPerformShrinking = false;
+
+			FMeshData& MeshData = Meshes.AddDefaulted_GetRef();
+			MeshData.MeshDescription = MeshDescription;
+			MeshData.Mesh = StaticMesh;
+			MeshData.bMirrored = bMirrored;
+			MeshData.MaterialIndices = Pair.Value;
+			MeshData.PrimitiveData = FPrimitiveData(Component);
+		}
+	}
+	if (Materials.Num() == 0)
+	{
+		UE_LOG(LogArmorPaint, Warning, TEXT("Nothing to bake for '%s', painting starts from an empty layer."), *Name);
+		return false;
+	}
+
+	TArray<FMaterialData*> MaterialPtrs;
+	TArray<FMeshData*> MeshPtrs;
+	for (int32 i = 0; i < Materials.Num(); i++)
+	{
+		MaterialPtrs.Add(&Materials[i]);
+		MeshPtrs.Add(&Meshes[i]);
+	}
+
+	FScopedSlowTask SlowTask(1, FText::Format(LOCTEXT("Baking", "Baking materials of {0}"), FText::FromString(Name)));
+	SlowTask.MakeDialog();
+	SlowTask.EnterProgressFrame(1);
+
+	TArray<FBakeOutput> Outputs;
+	IMaterialBakingModule& Baking = FModuleManager::LoadModuleChecked<IMaterialBakingModule>("MaterialBaking");
+	Baking.BakeMaterials(MaterialPtrs, MeshPtrs, Outputs);
+
+	// Each slot fills the pixels it rendered
+	const int32 NumPixels = BakeSize * BakeSize;
+	TMap<EMaterialProperty, TArray<FColor>> Combined;
+	for (EMaterialProperty Property : Properties)
+	{
+		TArray<FColor>& Pixels = Combined.Add(Property);
+		Pixels.Init(FColor::Magenta, NumPixels);
+		for (const FBakeOutput& Output : Outputs)
+		{
+			const TArray<FColor>* Data = Output.PropertyData.Find(Property);
+			const FIntPoint* Size = Output.PropertySizes.Find(Property);
+			if (!Data || !Size || Data->Num() != NumPixels || *Size != FIntPoint(BakeSize, BakeSize))
+			{
+				continue;
+			}
+			for (int32 i = 0; i < NumPixels; i++)
+			{
+				if ((*Data)[i] != FColor::Magenta)
+				{
+					Pixels[i] = (*Data)[i];
+				}
+			}
+		}
+		// Extend the borders of UV islands so that filtering does not pick up the background
+		FMaterialBakingHelpers::PerformUVBorderSmear(Pixels, BakeSize, BakeSize);
+	}
+	if (!Combined[MP_BaseColor].ContainsByPredicate([](const FColor& C) { return C != FColor::Magenta; }))
+	{
+		UE_LOG(LogArmorPaint, Warning, TEXT("Baking the materials of '%s' failed, painting starts from an empty layer."), *Name);
+		return false;
+	}
+
+	// Base color is baked in sRGB, the rest linear. Scalar properties are replicated to all channels.
+	auto Save = [&Dir, &OutPaths, BakeSize](const TCHAR* Type, TArray<FColor>& Pixels, EGammaSpace Gamma)
+	{
+		for (FColor& C : Pixels)
+		{
+			C.A = 255;
+		}
+		const FString Path = FString::Printf(TEXT("%s_%s.png"), *Dir, Type);
+		if (!FImageUtils::SaveImageByExtension(*Path, FImageView(Pixels.GetData(), BakeSize, BakeSize, Gamma)))
+		{
+			UE_LOG(LogArmorPaint, Error, TEXT("Failed to write %s"), *Path);
+			return;
+		}
+		OutPaths.Add(Type, Path);
+	};
+
+	TArray<FColor> Orm;
+	Orm.SetNumUninitialized(NumPixels);
+	const TArray<FColor>& Occlusion = Combined[MP_AmbientOcclusion];
+	const TArray<FColor>& Roughness = Combined[MP_Roughness];
+	const TArray<FColor>& Metallic = Combined[MP_Metallic];
+	for (int32 i = 0; i < NumPixels; i++)
+	{
+		Orm[i] = FColor(Occlusion[i].R, Roughness[i].R, Metallic[i].R, 255);
+	}
+
+	Save(TEXT("base"), Combined[MP_BaseColor], EGammaSpace::sRGB);
+	Save(TEXT("orm"), Orm, EGammaSpace::Linear);
+	Save(TEXT("nor"), Combined[MP_Normal], EGammaSpace::Linear);
+	UE_LOG(LogArmorPaint, Log, TEXT("Baked materials of '%s' (%d objects, %d slots)"), *Name, Targets.Num(), Materials.Num());
+	return OutPaths.Contains(TEXT("base"));
+}
+
+// Script run by ArmorPaint on a new project: fills the first layer with the baked textures and saves
+// the project to its .arm path, so that saving on close goes there without asking for a location
+FString FArmorPaintModule::LinkScript(const FString& Arm, const TMap<FString, FString>& Baked)
+{
+	FString Script;
+	if (Baked.Num() > 0)
+	{
+		// The new project has no other assets: indices follow the import order
+		Script += TEXT("int assets = 0;\n");
+		Script += TEXT("int import_texture(char *path) {\n\tscript_import_asset(path, false);\n\tassets = assets + 1;\n\treturn assets - 1;\n}\n\n");
+	}
+	Script += TEXT("void main() {\n");
+	if (Baked.Num() > 0)
+	{
+		Script += TEXT("\tslot_material_t *unreal = script_material_create(\"Unreal\");\n");
+		Script += TEXT("\tui_node_t *out = script_material_get_node(\"OUTPUT_MATERIAL_PBR\");\n");
+		Script += TEXT("\tui_node_t *tex;\n");
+		// Color space button of the image node: 0 auto, 1 linear, 2 sRGB, 3 DirectX normal map
+		// Output sockets: 0 base color, 2 occlusion, 3 roughness, 4 metallic, 5 normal map
+		if (const FString* Base = Baked.Find(TEXT("base")))
+		{
+			Script += TEXT("\ttex = script_material_create_node_at(\"TEX_IMAGE\", 72, 100);\n");
+			Script += FString::Printf(TEXT("\tscript_material_set_button(tex, 0, import_texture(%s));\n"), *CLiteral(*Base));
+			Script += TEXT("\tscript_material_connect(tex, 0, out, 0);\n");
+		}
+		if (const FString* Orm = Baked.Find(TEXT("orm")))
+		{
+			Script += TEXT("\ttex = script_material_create_node_at(\"TEX_IMAGE\", 72, 280);\n");
+			Script += FString::Printf(TEXT("\tscript_material_set_button(tex, 0, import_texture(%s));\n"), *CLiteral(*Orm));
+			Script += TEXT("\tscript_material_set_button(tex, 1, 1);\n");
+			Script += TEXT("\tui_node_t *sep = script_material_create_node_at(\"SEPARATE_COLOR\", 300, 280);\n");
+			Script += TEXT("\tscript_material_connect(tex, 0, sep, 0);\n");
+			Script += TEXT("\tscript_material_connect(sep, 0, out, 2);\n");
+			Script += TEXT("\tscript_material_connect(sep, 1, out, 3);\n");
+			Script += TEXT("\tscript_material_connect(sep, 2, out, 4);\n");
+		}
+		if (const FString* Nor = Baked.Find(TEXT("nor")))
+		{
+			Script += TEXT("\ttex = script_material_create_node_at(\"TEX_IMAGE\", 72, 460);\n");
+			Script += FString::Printf(TEXT("\tscript_material_set_button(tex, 0, import_texture(%s));\n"), *CLiteral(*Nor));
+			Script += TEXT("\tscript_material_set_button(tex, 1, 3);\n");
+			Script += TEXT("\tscript_material_connect(tex, 0, out, 5);\n");
+		}
+		Script += TEXT("\tscript_material_update();\n");
+		// The layer keeps the filled pixels, the material is not needed afterwards
+		Script += TEXT("\tscript_fill_layer();\n");
+		Script += TEXT("\tscript_material_delete(unreal);\n");
+	}
+	Script += FString::Printf(TEXT("\tproject_filepath_set(%s);\n"), *CLiteral(Arm));
+	Script += TEXT("\tproject_save(0);\n}\n");
+	return Script;
 }
 
 // Waits for ArmorPaint instances started by the plugin to close
@@ -857,9 +1131,187 @@ void FArmorPaintModule::ApplyMaterial(const TArray<UStaticMeshComponent*>& Compo
 	}
 }
 
+// Records the material overrides of the components, an empty path means the slot shows the static mesh material
+void FArmorPaintModule::SaveOriginalMaterials(const FString& Name, const TArray<FPaintTarget>& Targets)
+{
+	TArray<TSharedPtr<FJsonValue>> Entries;
+	for (const FPaintTarget& T : Targets)
+	{
+		TArray<TSharedPtr<FJsonValue>> Materials;
+		for (UMaterialInterface* Material : T.Component->OverrideMaterials)
+		{
+			const bool bOriginal = Material && ProjectOfMaterial(Material).IsEmpty();
+			Materials.Add(MakeShared<FJsonValueString>(bOriginal ? Material->GetPathName() : FString()));
+		}
+		TSharedRef<FJsonObject> Entry = MakeShared<FJsonObject>();
+		Entry->SetStringField(TEXT("component"), ComponentKey(T.Component));
+		Entry->SetArrayField(TEXT("materials"), Materials);
+		Entries.Add(MakeShared<FJsonValueObject>(Entry));
+	}
+	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetArrayField(TEXT("components"), Entries);
+
+	FString Json;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Json);
+	if (!FJsonSerializer::Serialize(Root, Writer) || !SaveUtf8(Json, OriginalsPath(Name)))
+	{
+		UE_LOG(LogArmorPaint, Error, TEXT("Failed to write %s"), *OriginalsPath(Name));
+	}
+}
+
+// Components without a record are reset to the materials of their static mesh
+void FArmorPaintModule::RestoreOriginalMaterials(const FString& Name, const TArray<UStaticMeshComponent*>& Components)
+{
+	TMap<FString, TArray<FString>> Recorded;
+	FString Json;
+	TSharedPtr<FJsonObject> Root;
+	if (FFileHelper::LoadFileToString(Json, *OriginalsPath(Name)) && FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Root) && Root.IsValid())
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Entries = nullptr;
+		if (Root->TryGetArrayField(TEXT("components"), Entries))
+		{
+			for (const TSharedPtr<FJsonValue>& Value : *Entries)
+			{
+				const TSharedPtr<FJsonObject>* Entry = nullptr;
+				FString Key;
+				TArray<FString> Materials;
+				if (Value->TryGetObject(Entry) && (*Entry)->TryGetStringField(TEXT("component"), Key) && (*Entry)->TryGetStringArrayField(TEXT("materials"), Materials))
+				{
+					Recorded.Add(Key, Materials);
+				}
+			}
+		}
+	}
+
+	for (UStaticMeshComponent* Component : Components)
+	{
+		Component->Modify();
+		Component->EmptyOverrideMaterials();
+		const TArray<FString>* Materials = Recorded.Find(ComponentKey(Component));
+		if (!Materials)
+		{
+			UE_LOG(LogArmorPaint, Log, TEXT("No recorded materials for %s, it shows the materials of its static mesh."), *ComponentKey(Component));
+			continue;
+		}
+		for (int32 i = 0; i < Materials->Num(); i++)
+		{
+			if ((*Materials)[i].IsEmpty())
+			{
+				continue;
+			}
+			UMaterialInterface* Material = LoadObject<UMaterialInterface>(nullptr, *(*Materials)[i], nullptr, LOAD_NoWarn | LOAD_Quiet);
+			if (!Material)
+			{
+				UE_LOG(LogArmorPaint, Warning, TEXT("Original material %s of %s was not found."), *(*Materials)[i], *ComponentKey(Component));
+				continue;
+			}
+			Component->SetMaterial(i, Material);
+		}
+	}
+}
+
+// Restores the original materials of all objects in the selected projects and deletes the projects
+void FArmorPaintModule::UnpaintButtonClicked()
+{
+	TArray<AActor*> Actors;
+	if (GEditor)
+	{
+		GEditor->GetSelectedActors()->GetSelectedObjects<AActor>(Actors);
+	}
+	TSet<FString> Projects;
+	for (AActor* Actor : Actors)
+	{
+		TInlineComponentArray<UStaticMeshComponent*> Components(Actor);
+		for (UStaticMeshComponent* C : Components)
+		{
+			const FString Name = PaintedProject(C);
+			if (!Name.IsEmpty())
+			{
+				Projects.Add(Name);
+			}
+		}
+	}
+	if (Projects.Num() == 0)
+	{
+		FMessageDialog::Open(EAppMsgType::Ok, LOCTEXT("NothingToRestore", "None of the selected actors is painted with ArmorPaint."));
+		return;
+	}
+
+	for (const FString& Name : Projects)
+	{
+		const FString Arm = ArmPath(Name);
+		if (Pending.ContainsByPredicate([&Arm](const FPending& P) { return P.ArmPath == Arm; }))
+		{
+			FMessageDialog::Open(EAppMsgType::Ok, FText::Format(LOCTEXT("RestoreWhilePainting", "'{0}' is open in ArmorPaint, close it before restoring the original materials."), FText::FromString(Name)));
+			return;
+		}
+	}
+
+	TMap<FString, TArray<UStaticMeshComponent*>> Painted;
+	TArray<FString> Labels;
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		bool bPainted = false;
+		TInlineComponentArray<UStaticMeshComponent*> Components(*It);
+		for (UStaticMeshComponent* C : Components)
+		{
+			const FString Name = PaintedProject(C);
+			if (Projects.Contains(Name))
+			{
+				Painted.FindOrAdd(Name).Add(C);
+				bPainted = true;
+			}
+		}
+		if (bPainted)
+		{
+			Labels.Add(It->GetActorLabel());
+		}
+	}
+	Labels.Sort();
+
+	TArray<FString> ProjectNames = Projects.Array();
+	ProjectNames.Sort();
+	const FText Message = FText::Format(
+		LOCTEXT("ConfirmRestore", "Restore the original materials of:\n{0}\n\nThe ArmorPaint project {1} will be deleted."),
+		FText::FromString(FString::Join(Labels, TEXT(", "))),
+		FText::FromString(FString::Join(ProjectNames, TEXT(", "))));
+	if (FMessageDialog::Open(EAppMsgType::YesNo, Message) != EAppReturnType::Yes)
+	{
+		return;
+	}
+
+	{
+		FScopedTransaction Transaction(LOCTEXT("Unpaint", "Unpaint"));
+		for (const TPair<FString, TArray<UStaticMeshComponent*>>& Pair : Painted)
+		{
+			RestoreOriginalMaterials(Pair.Key, Pair.Value);
+		}
+	}
+
+	// Textures and the material stay in /Game/ArmorPaint/<Name>, painting again reimports into them
+	for (const FString& Name : ProjectNames)
+	{
+		if (!IFileManager::Get().DeleteDirectory(*(ProjectsDir() / Name), false, true))
+		{
+			UE_LOG(LogArmorPaint, Error, TEXT("Failed to delete %s"), *(ProjectsDir() / Name));
+		}
+	}
+
+	UE_LOG(LogArmorPaint, Log, TEXT("Restored original materials of %s, deleted ArmorPaint project %s"), *FString::Join(Labels, TEXT(", ")), *FString::Join(ProjectNames, TEXT(", ")));
+	Notify(FText::Format(LOCTEXT("Restored", "ArmorPaint: original materials of {0} restored."), FText::FromString(FString::Join(Labels, TEXT(", ")))));
+}
+
+TSharedRef<SWidget> FArmorPaintModule::MakeToolbarMenu()
+{
+	FMenuBuilder MenuBuilder(true, PluginCommands);
+	MenuBuilder.AddMenuEntry(FArmorPaintCommands::Get().PluginAction, NAME_None, LOCTEXT("PaintLabel", "Paint in ArmorPaint"));
+	MenuBuilder.AddMenuEntry(FArmorPaintCommands::Get().UnpaintAction);
+	return MenuBuilder.MakeWidget();
+}
+
 void FArmorPaintModule::RegisterMenus()
 {
-	// Owner will be used for cleanup in call to UToolMenus::UnregisterOwner
 	FToolMenuOwnerScoped OwnerScoped(this);
 
 	{
@@ -867,6 +1319,7 @@ void FArmorPaintModule::RegisterMenus()
 		{
 			FToolMenuSection& Section = Menu->FindOrAddSection("WindowLayout");
 			Section.AddMenuEntryWithCommandList(FArmorPaintCommands::Get().PluginAction, PluginCommands);
+			Section.AddMenuEntryWithCommandList(FArmorPaintCommands::Get().UnpaintAction, PluginCommands);
 		}
 	}
 
@@ -878,7 +1331,25 @@ void FArmorPaintModule::RegisterMenus()
 				FToolMenuEntry& Entry = Section.AddEntry(FToolMenuEntry::InitToolBarButton(FArmorPaintCommands::Get().PluginAction));
 				Entry.SetCommandList(PluginCommands);
 			}
+			{
+				FToolMenuEntry& Entry = Section.AddEntry(FToolMenuEntry::InitComboButton(
+					"ArmorPaintOptions",
+					FUIAction(),
+					FOnGetContent::CreateRaw(this, &FArmorPaintModule::MakeToolbarMenu),
+					LOCTEXT("OptionsLabel", "ArmorPaint Options"),
+					LOCTEXT("OptionsTooltip", "ArmorPaint options"),
+					FSlateIcon(),
+					true));
+				Entry.SetCommandList(PluginCommands);
+			}
 		}
+	}
+
+	{
+		UToolMenu* Menu = UToolMenus::Get()->ExtendMenu("LevelEditor.ActorContextMenu");
+		FToolMenuSection& Section = Menu->FindOrAddSection("ArmorPaint", LOCTEXT("ContextMenuHeading", "ArmorPaint"));
+		Section.AddMenuEntryWithCommandList(FArmorPaintCommands::Get().PluginAction, PluginCommands, LOCTEXT("PaintLabel", "Paint in ArmorPaint"));
+		Section.AddMenuEntryWithCommandList(FArmorPaintCommands::Get().UnpaintAction, PluginCommands);
 	}
 }
 

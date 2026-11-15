@@ -4,7 +4,6 @@
 #include "ArmorPaint.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Styling/SlateStyleRegistry.h"
-#include "Slate/SlateGameResources.h"
 #include "Interfaces/IPluginManager.h"
 #include "Styling/SlateStyleMacros.h"
 
@@ -34,10 +33,7 @@ FName FArmorPaintStyle::GetStyleSetName()
 	return StyleSetName;
 }
 
-
-const FVector2D Icon16x16(16.0f, 16.0f);
-const FVector2D Icon20x20(20.0f, 20.0f);
-const FVector2D Icon40x40(40.0f, 40.0f);
+static const FVector2D Icon40x40(40.0f, 40.0f);
 
 TSharedRef< FSlateStyleSet > FArmorPaintStyle::Create()
 {

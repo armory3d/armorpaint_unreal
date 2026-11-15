@@ -9,15 +9,13 @@
 class FArmorPaintCommands : public TCommands<FArmorPaintCommands>
 {
 public:
-
 	FArmorPaintCommands()
 		: TCommands<FArmorPaintCommands>(TEXT("ArmorPaint"), NSLOCTEXT("Contexts", "ArmorPaint", "ArmorPaint Plugin"), NAME_None, FArmorPaintStyle::GetStyleSetName())
 	{
 	}
 
-	// TCommands<> interface
 	virtual void RegisterCommands() override;
 
-public:
-	TSharedPtr< FUICommandInfo > PluginAction;
+	TSharedPtr<FUICommandInfo> PluginAction;
+	TSharedPtr<FUICommandInfo> UnpaintAction;
 };
